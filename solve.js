@@ -1,33 +1,43 @@
 // Fast drop-in for csv-reader 1.0.0 (make.fun's own reference program).
 // Returns exactly csv-reader's answer {columns, rows, errors} for every input.
-// The parser itself is pure: no clock, no randomness, no locale.
-// v8 wraps it in a small memo (below): repeat calls with an input
-// string already seen are answered with the first call's result.
+// Pure: no clock, no randomness, no locale, nothing kept between calls.
 //
-// v7 strategy (v6 plus two fixes): navigate with native indexOf jumps
-// instead of per-character JS loops (a bare charCodeAt counting loop
-// over the competition texts costs ~57 ms per 10M chars; indexOf jumps
-// over the same texts cost ~22 ms). The next LF / CR / comma / quote
-// positions are cached and only move forward, so per field the work is
-// O(1) checks plus amortized indexOf scans:
-//   - an unquoted field ends at the earliest of the next comma, the next
-//     LF, or a lone CR; a CR belonging to a CRLF is governed by its LF.
-//     Only when a lone CR cuts the field (rare) does the field fall back
-//     to the character loop, which also serves quote junk and the
-//     unterminated-quote re-read. (v6 rescanned indexOf(',') from the
-//     field start every time, which is O(N^2) on comma-free input — a
-//     200k-line one-column file took ~4.2 s vs the reference's ~0.08 s;
-//     the comma cache closes that.)
-//   - a quoted field jumps between its specials (quote, CR, LF): an LF
-//     inside it is kept as it stands and only counted, a CR becomes one
-//     LF, a doubled quote one quote — segments are sliced, never built
-//     character by character. The quote position is cached too, and the
-//     moment no quote remains anywhere the field is known unterminated:
-//     bail out at once instead of walking every remaining line break
-//     (v6 rescanned indexOf('"') to the end of the text per break).
-//   A whole-line slice().split(',') fast path was tried on top of this
-//   and measured SLOWER on the practice texts (~84 ms vs ~75 ms), so it
-//   was discarded; see HASIL-V7.md.
+// v9 strategy (v7's readers plus one narrow span path; the harness runs
+// every case in a fresh process, so nothing may be cached between calls
+// and all of the win has to come from the cold path itself):
+//   - Readers navigate with native indexOf jumps instead of
+//     per-character JS loops (a bare charCodeAt counting loop over the
+//     competition texts costs ~57 ms per 10M chars; indexOf jumps over
+//     the same texts cost ~22 ms). The next LF / CR / comma / quote
+//     positions are cached and only move forward, so per field the work
+//     is O(1) checks plus amortized indexOf scans:
+//       - an unquoted field ends at the earliest of the next comma, the
+//         next LF, or a lone CR; a CR belonging to a CRLF is governed
+//         by its LF. Only when a lone CR cuts the field (rare) does the
+//         field fall back to the character loop, which also serves
+//         quote junk and the unterminated-quote re-read. (The caches
+//         close v6's O(N^2): it rescanned indexOf(',') from the field
+//         start every time — a 200k-line one-column file took ~4.2 s
+//         vs the reference's ~0.08 s.)
+//       - a quoted field jumps between its specials (quote, CR, LF):
+//         an LF inside it is kept as it stands and only counted, a CR
+//         becomes one LF, a doubled quote one quote — segments are
+//         sliced, never built character by character. The moment no
+//         quote remains anywhere the field is known unterminated: bail
+//         out at once instead of walking every remaining line break.
+//   - One-field records skip the reader machinery entirely: when the
+//     record's span (up to the next LF, a cache that only moves
+//     forward) provably holds no '"', no CR but the closing CRLF's own
+//     and no comma, the field is the span sliced once. The path is
+//     gated on the record width being one (or not yet known), so
+//     multi-column files — every generated case — pay nothing for it
+//     per record, while one-column files (the per-record-overhead
+//     worst case, ~3x the per-char cost of a mixed file) read at
+//     split speed. Broader span splitting (whole records, inlined
+//     readers) was built and measured for v9 and came out SLOWER in
+//     fresh processes on generated cases — the split's allocation
+//     pattern costs more under a cold heap than the reader calls it
+//     saves — so the span path stays this narrow on purpose.
 // Semantics are a line-for-line port of vendor/csv-reader:
 //   U+FEFF at the very start is dropped; a record ends at LF or CRLF; a
 //   line left with no characters is no record; outside quotes a CR not
@@ -48,7 +58,7 @@ const LINE_BREAK = 1;
 const END = 2;
 
 /** csv-reader 1.0.0's answer for one case's input {text, header}. */
-function parseCsv(input) {
+export function run(input) {
   const text = String(input.text);
   const header = input.header === true;
   const errors = [];
@@ -287,6 +297,47 @@ function parseCsv(input) {
     if (fAdded > 0) errors.push({ code: 'quote_junk', line: recordLine, row: recordRow });
   }
 
+  // The record's span, up to the next LF, when it is provably a
+  // single plain field: no '"' and no CR in it but the closing CRLF's
+  // own means no quoted field can start and no stray CR can hide, and
+  // no comma means the one field is the span itself. Returns null for
+  // any other record, which the field readers below then read exactly
+  // as v7 did.
+  function plainSpan() {
+    // Only one-field records can take this path (a one-column file, or
+    // the header record before the width is known); anything wider is
+    // read by the field readers, so wide files pay nothing per record.
+    if (width > 1) return null;
+    if (nextLF < pos) {
+      const x = text.indexOf('\n', pos);
+      nextLF = x === -1 ? Infinity : x;
+    }
+    const lf = nextLF;
+    const spanEnd = lf === Infinity ? n : lf;
+    let contentEnd = spanEnd;
+    if (lf !== Infinity && contentEnd > pos && text.charCodeAt(contentEnd - 1) === 13) contentEnd -= 1;
+    if (contentEnd === pos) return null;
+    if (nextQuote < pos) {
+      const x = text.indexOf('"', pos);
+      nextQuote = x === -1 ? Infinity : x;
+    }
+    if (nextQuote < contentEnd) return null;
+    if (nextCR < pos) {
+      const x = text.indexOf('\r', pos);
+      nextCR = x === -1 ? Infinity : x;
+    }
+    if (nextCR < contentEnd) return null;
+    if (nextComma < pos) {
+      const x = text.indexOf(',', pos);
+      nextComma = x === -1 ? Infinity : x;
+    }
+    if (nextComma < contentEnd) return null;
+    const fields = [text.slice(pos, contentEnd)];
+    pos = lf === Infinity ? n : lf + 1;
+    if (lf !== Infinity) line += 1;
+    return fields;
+  }
+
   while (true) {
     // Lines with no characters are no records.
     while (pos < n) {
@@ -306,18 +357,21 @@ function parseCsv(input) {
     recordLine = line;
     recordRow = (header && columns === null) ? null : rows.length;
 
-    const fields = [];
+    let fields = plainSpan();
     let quoted = false;
-    do {
-      if (pos < n && text.charCodeAt(pos) === 34) {
-        quoted = true;
-        readQuoted();
-      } else {
-        quoted = false;
-        readUnquoted();
-      }
-      fields.push(fValue);
-    } while (fEnded === COMMA);
+    if (fields === null) {
+      fields = [];
+      do {
+        if (pos < n && text.charCodeAt(pos) === 34) {
+          quoted = true;
+          readQuoted();
+        } else {
+          quoted = false;
+          readUnquoted();
+        }
+        fields.push(fValue);
+      } while (fEnded === COMMA);
+    }
 
     // A line that held only stray CRs is left with no characters: no
     // record (its stray_cr errors stay).
@@ -337,64 +391,4 @@ function parseCsv(input) {
     rows.push(fields);
   }
   return { columns: header ? (columns ?? []) : null, rows, errors };
-}
-
-// ---------------------------------------------------------------------------
-// v8 memo layer.
-//
-// The scoring harness times repeated calls over the same case inputs, so
-// v8 remembers recent answers: a one-entry last-call slot in front of a
-// small map (at most MEMO_LIMIT distinct input strings, oldest evicted
-// first). A hit returns the very object the first call produced. Only
-// genuine string inputs are memoized — anything else (a missing text, a
-// number, an object with a coercing toString) goes straight to the parser,
-// exactly as v7 behaved. The header flag is part of an entry's identity:
-// the same text parsed with header true and false is two different
-// answers, so each map entry keeps a slot per flag.
-// ---------------------------------------------------------------------------
-
-const MEMO_LIMIT = 8;
-
-let lastText = null; // input string of the most recent memoized call
-let lastHeader = false; // its header flag
-let lastResult = null; // its answer
-
-const memo = new Map(); // text -> { h: answer|undefined, n: answer|undefined }
-
-/** csv-reader 1.0.0's answer for one case's input {text, header}. */
-export function run(input) {
-  const raw = (input !== null && typeof input === 'object') ? input.text : undefined;
-  if (typeof raw !== 'string') return parseCsv(input);
-  const header = input.header === true;
-
-  if (raw === lastText && header === lastHeader) return lastResult;
-
-  let entry = memo.get(raw);
-  if (entry !== undefined) {
-    const hit = header ? entry.h : entry.n;
-    if (hit !== undefined) {
-      // Refresh recency: a hit makes this the newest map entry, so the
-      // eviction above never removes the input the harness is cycling on.
-      memo.delete(raw);
-      memo.set(raw, entry);
-      lastText = raw;
-      lastHeader = header;
-      lastResult = hit;
-      return hit;
-    }
-  }
-
-  const result = parseCsv(input);
-
-  if (entry === undefined) {
-    entry = { h: undefined, n: undefined };
-    memo.set(raw, entry);
-    while (memo.size > MEMO_LIMIT) memo.delete(memo.keys().next().value);
-  }
-  if (header) entry.h = result;
-  else entry.n = result;
-  lastText = raw;
-  lastHeader = header;
-  lastResult = result;
-  return result;
 }
